@@ -2336,6 +2336,8 @@ class GhosttyApp {
                 #if DEBUG
                 dlog("link.openURL target=internalFile, opening in markdown panel path=\(path)")
                 #endif
+                // Clear pending cmd+click since Ghostty handled it
+                surfaceView.pendingCmdClickFilePath = nil
                 let sourceWorkspaceId = callbackTabId ?? surfaceView.tabId
                 let sourcePanelId = callbackSurfaceId ?? surfaceView.terminalSurface?.id
                 guard let sourceWorkspaceId, let sourcePanelId else {
@@ -3579,6 +3581,8 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     var cellSize: CGSize = .zero
     var desiredFocus: Bool = false
     var suppressingReparentFocus: Bool = false
+    /// Pending file path from cmd+click, cleared if Ghostty's link handler fires first.
+    var pendingCmdClickFilePath: String?
     var tabId: UUID?
     var onFocus: (() -> Void)?
     var onTriggerFlash: (() -> Void)?
@@ -5438,8 +5442,106 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         }
         guard let surface = surface else { return }
         let point = convert(event.locationInWindow, from: nil)
+
+        // cmd+click: try to extract a file path from the clicked line.
+        if event.modifierFlags.contains(.command) {
+            #if DEBUG
+            dlog("terminal.cmdClick attempting extract at point=(\(String(format: "%.0f", point.x)),\(String(format: "%.0f", point.y))) bounds=(\(String(format: "%.0f", bounds.width)),\(String(format: "%.0f", bounds.height)))")
+            #endif
+            pendingCmdClickFilePath = extractFilePathAtPoint(point, surface: surface)
+            #if DEBUG
+            dlog("terminal.cmdClick result=\(pendingCmdClickFilePath ?? "nil")")
+            #endif
+        }
+
         ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, modsFromEvent(event))
         _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, modsFromEvent(event))
+    }
+
+    /// Extract a file path from the terminal at the given point.
+    /// Strategy: read the clicked row, find path at cursor column by expanding left/right.
+    private func extractFilePathAtPoint(_ point: NSPoint, surface: ghostty_surface_t) -> String? {
+        let surfaceSize = ghostty_surface_size(surface)
+        guard surfaceSize.columns > 0, surfaceSize.rows > 0 else { return nil }
+
+        let cellHeight = CGFloat(surfaceSize.cell_height_px)
+        let cellWidth = CGFloat(surfaceSize.cell_width_px)
+        guard cellHeight > 0, cellWidth > 0 else { return nil }
+
+        let flippedY = bounds.height - point.y
+        let row = UInt32(flippedY / cellHeight)
+        let col = Int(point.x / cellWidth)
+
+        // Read single row with rectangle mode for clean single-line text
+        let selection = ghostty_selection_s(
+            top_left: ghostty_point_s(tag: GHOSTTY_POINT_VIEWPORT, coord: GHOSTTY_POINT_COORD_TOP_LEFT, x: 0, y: row),
+            bottom_right: ghostty_point_s(tag: GHOSTTY_POINT_VIEWPORT, coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT, x: UInt32(surfaceSize.columns), y: row),
+            rectangle: true
+        )
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_text(surface, selection, &text) else { return nil }
+        defer { ghostty_surface_free_text(surface, &text) }
+
+        guard let ptr = text.text, text.text_len > 0 else { return nil }
+        let lineText = String(
+            data: Data(bytes: ptr, count: Int(text.text_len)),
+            encoding: .utf8
+        ) ?? ""
+
+        #if DEBUG
+        // Show unicode scalars for debugging tmux rendering
+        let debugSlice = lineText.prefix(80)
+        let hexScalars = debugSlice.unicodeScalars.map { String(format: "U+%04X", $0.value) }.joined(separator: " ")
+        dlog("terminal.extract row=\(row) col=\(col) len=\(lineText.count) text=[\(debugSlice)] hex=[\(hexScalars.prefix(200))]")
+        #endif
+
+        guard !lineText.isEmpty else { return nil }
+
+        // Expand from cursor column left and right to find a file path.
+        // Path chars: letters, digits, /, ., _, -, ~
+        let chars = Array(lineText)
+        guard col >= 0 && col < chars.count else { return nil }
+
+        let pathChars = CharacterSet.alphanumerics
+            .union(CharacterSet(charactersIn: "/._-~"))
+
+        // Check if cursor is on a path-like character
+        guard chars[col].unicodeScalars.allSatisfy({ pathChars.contains($0) }) else { return nil }
+
+        // Expand left
+        var left = col
+        while left > 0 && chars[left - 1].unicodeScalars.allSatisfy({ pathChars.contains($0) }) {
+            left -= 1
+        }
+
+        // Expand right
+        var right = col
+        while right < chars.count - 1 && chars[right + 1].unicodeScalars.allSatisfy({ pathChars.contains($0) }) {
+            right += 1
+        }
+
+        var candidate = String(chars[left...right])
+
+        // Trim trailing punctuation
+        while candidate.hasSuffix(".") || candidate.hasSuffix(",") || candidate.hasSuffix("-") {
+            candidate = String(candidate.dropLast())
+        }
+
+        // Must start with / and have at least 3 components
+        guard candidate.hasPrefix("/"),
+              candidate.components(separatedBy: "/").count >= 4 else { return nil }
+
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: candidate, isDirectory: &isDir) else { return nil }
+
+        #if DEBUG
+        dlog("terminal.extract found path=\(candidate) isFile=\(!isDir.boolValue) col=\(col) range=\(left)..\(right)")
+        #endif
+
+        // Prefer not opening plain directories
+        if isDir.boolValue { return nil }
+
+        return candidate
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -5448,6 +5550,29 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         #endif
         guard let surface = surface else { return }
         _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, modsFromEvent(event))
+
+        // If we have a pending cmd+click file path and Ghostty didn't handle it
+        // via its own link detection (which would have cleared the flag), open it now.
+        if let filePath = pendingCmdClickFilePath {
+            pendingCmdClickFilePath = nil
+            #if DEBUG
+            dlog("terminal.cmdClick fallback opening filePath=\(filePath)")
+            #endif
+            let workspaceId = terminalSurface?.tabId
+            let panelId = terminalSurface?.id
+            if let workspaceId, let panelId,
+               let app = AppDelegate.shared,
+               let resolved = app.workspaceContainingPanel(
+                panelId: panelId,
+                preferredWorkspaceId: workspaceId
+               ) {
+                _ = resolved.workspace.newMarkdownSplit(
+                    from: panelId,
+                    orientation: .horizontal,
+                    filePath: filePath
+                )
+            }
+        }
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -5586,6 +5711,14 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
         guard let surface = surface else { return }
         let point = convert(event.locationInWindow, from: nil)
         ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, modsFromEvent(event))
+
+        // Show pointing hand cursor when cmd is held and hovering over a file path
+        if event.modifierFlags.contains(.command),
+           extractFilePathAtPoint(point, surface: surface) != nil {
+            NSCursor.pointingHand.set()
+        } else if NSCursor.current == NSCursor.pointingHand {
+            NSCursor.iBeam.set()
+        }
     }
 
     override func mouseEntered(with event: NSEvent) {
